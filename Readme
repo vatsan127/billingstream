@@ -1,214 +1,178 @@
-Plan to implement                                                                                                                                                       │
-                                                                                                                                                                        │
-BillingStream — Billing Transaction Application                                                                                                                         │
-                                                                                                                                                                        │
-Context                                                                                                                                                                 │
-                                                                                                                                                                        │
-Replace the existing OTT subscription billing code with a new billing transaction use case. The app processes Card and GPay payment transactions via Kafka Streams,     │
-performing filtering, transformation, branching, aggregation, and windowing. Built all at once (no phased approach).                                                    │
-                                                                                                                                                                        │
-Use Case Summary                                                                                                                                                        │
-                                                                                                                                                                        │
-Merchants/users make billing transactions via Card or GPay. The system:                                                                                                 │
-1. Filters failed transactions → routes to a DLQ (dead-letter queue) topic                                                                                              │
-2. Transforms Card and GPay transactions (which have different fields) into a unified transaction format                                                                │
-3. Branches/Splits unified transactions by payment method into separate topics                                                                                          │
-4. Aggregates total transaction amount per payment method                                                                                                               │
-5. Windows transaction count per minute per payment method                                                                                                              │
-                                                                                                                                                                        │
----                                                                                                                                                                     │
-Data Models                                                                                                                                                             │
-                                                                                                                                                                        │
-CardTransaction (input)                                                                                                                                                 │
-                                                                                                                                                                        │
-┌────────────────┬─────────┬─────────────────────────────────────┐                                                                                                      │
-│     Field      │  Type   │             Description             │                                                                                                      │
-├────────────────┼─────────┼─────────────────────────────────────┤                                                                                                      │
-│ transactionId  │ String  │ Unique ID                           │                                                                                                      │
-├────────────────┼─────────┼─────────────────────────────────────┤                                                                                                      │
-│ userId         │ String  │ User identifier                     │                                                                                                      │
-├────────────────┼─────────┼─────────────────────────────────────┤                                                                                                      │
-│ amount         │ double  │ Transaction amount                  │                                                                                                      │
-├────────────────┼─────────┼─────────────────────────────────────┤                                                                                                      │
-│ status         │ String  │ SUCCESS / FAILED                    │                                                                                                      │
-├────────────────┼─────────┼─────────────────────────────────────┤                                                                                                      │
-│ cardNumber     │ String  │ Masked card number (e.g., ****1234) │                                                                                                      │
-├────────────────┼─────────┼─────────────────────────────────────┤                                                                                                      │
-│ cardHolderName │ String  │ Name on card                        │                                                                                                      │
-├────────────────┼─────────┼─────────────────────────────────────┤                                                                                                      │
-│ cardNetwork    │ String  │ VISA / MASTERCARD / RUPAY           │                                                                                                      │
-├────────────────┼─────────┼─────────────────────────────────────┤                                                                                                      │
-│ expiryDate     │ String  │ MM/YY                               │                                                                                                      │
-├────────────────┼─────────┼─────────────────────────────────────┤                                                                                                      │
-│ timestamp      │ Instant │ Transaction time                    │                                                                                                      │
-└────────────────┴─────────┴─────────────────────────────────────┘                                                                                                      │
-                                                                                                                                                                        │
-GPayTransaction (input)                                                                                                                                                 │
-                                                                                                                                                                        │
-┌─────────────────┬─────────┬───────────────────────────┐                                                                                                               │
-│      Field      │  Type   │        Description        │                                                                                                               │
-├─────────────────┼─────────┼───────────────────────────┤                                                                                                               │
-│ transactionId   │ String  │ Unique ID                 │                                                                                                               │
-├─────────────────┼─────────┼───────────────────────────┤                                                                                                               │
-│ userId          │ String  │ User identifier           │                                                                                                               │
-├─────────────────┼─────────┼───────────────────────────┤                                                                                                               │
-│ amount          │ double  │ Transaction amount        │                                                                                                               │
-├─────────────────┼─────────┼───────────────────────────┤                                                                                                               │
-│ status          │ String  │ SUCCESS / FAILED          │                                                                                                               │
-├─────────────────┼─────────┼───────────────────────────┤                                                                                                               │
-│ upiId           │ String  │ UPI ID (e.g., user@oksbi) │                                                                                                               │
-├─────────────────┼─────────┼───────────────────────────┤                                                                                                               │
-│ deviceId        │ String  │ Device identifier         │                                                                                                               │
-├─────────────────┼─────────┼───────────────────────────┤                                                                                                               │
-│ gpayReferenceId │ String  │ GPay internal reference   │                                                                                                               │
-├─────────────────┼─────────┼───────────────────────────┤                                                                                                               │
-│ timestamp       │ Instant │ Transaction time          │                                                                                                               │
-└─────────────────┴─────────┴───────────────────────────┘                                                                                                               │
-                                                                                                                                                                        │
-UnifiedTransaction (after transformation)                                                                                                                               │
-                                                                                                                                                                        │
-┌──────────────────┬─────────┬────────────────────────────────────────────────┐                                                                                         │
-│      Field       │  Type   │                  Description                   │                                                                                         │
-├──────────────────┼─────────┼────────────────────────────────────────────────┤                                                                                         │
-│ transactionId    │ String  │ Unique ID                                      │                                                                                         │
-├──────────────────┼─────────┼────────────────────────────────────────────────┤                                                                                         │
-│ userId           │ String  │ User identifier                                │                                                                                         │
-├──────────────────┼─────────┼────────────────────────────────────────────────┤                                                                                         │
-│ amount           │ double  │ Transaction amount                             │                                                                                         │
-├──────────────────┼─────────┼────────────────────────────────────────────────┤                                                                                         │
-│ status           │ String  │ SUCCESS / FAILED                               │                                                                                         │
-├──────────────────┼─────────┼────────────────────────────────────────────────┤                                                                                         │
-│ paymentMethod    │ String  │ CARD / GPAY                                    │                                                                                         │
-├──────────────────┼─────────┼────────────────────────────────────────────────┤                                                                                         │
-│ paymentReference │ String  │ cardNumber for Card, upiId for GPay            │                                                                                         │
-├──────────────────┼─────────┼────────────────────────────────────────────────┤                                                                                         │
-│ paymentDetail    │ String  │ cardNetwork for Card, gpayReferenceId for GPay │                                                                                         │
-├──────────────────┼─────────┼────────────────────────────────────────────────┤                                                                                         │
-│ timestamp        │ Instant │ Transaction time                               │                                                                                         │
-└──────────────────┴─────────┴────────────────────────────────────────────────┘                                                                                         │
-                                                                                                                                                                        │
-Enums                                                                                                                                                                   │
-                                                                                                                                                                        │
-- PaymentMethod: CARD, GPAY                                                                                                                                             │
-- TransactionStatus: SUCCESS, FAILED                                                                                                                                    │
-                                                                                                                                                                        │
----                                                                                                                                                                     │
-Kafka Topics                                                                                                                                                            │
-                                                                                                                                                                        │
-┌─────────────────────────┬─────────────────────────────────────────────┐                                                                                               │
-│          Topic          │                   Purpose                   │                                                                                               │
-├─────────────────────────┼─────────────────────────────────────────────┤                                                                                               │
-│ card-transactions       │ Input — raw Card transactions               │                                                                                               │
-├─────────────────────────┼─────────────────────────────────────────────┤                                                                                               │
-│ gpay-transactions       │ Input — raw GPay transactions               │                                                                                               │
-├─────────────────────────┼─────────────────────────────────────────────┤                                                                                               │
-│ failed-transactions-dlq │ DLQ — failed transactions from both methods │                                                                                               │
-├─────────────────────────┼─────────────────────────────────────────────┤                                                                                               │
-│ unified-transactions    │ Transformed unified format                  │                                                                                               │
-├─────────────────────────┼─────────────────────────────────────────────┤                                                                                               │
-│ transactions-card       │ Branch output — Card transactions only      │                                                                                               │
-├─────────────────────────┼─────────────────────────────────────────────┤                                                                                               │
-│ transactions-gpay       │ Branch output — GPay transactions only      │                                                                                               │
-└─────────────────────────┴─────────────────────────────────────────────┘                                                                                               │
-                                                                                                                                                                        │
-State stores (materialized, queryable via REST):                                                                                                                        │
-- total-amount-by-method — aggregated total amount per payment method                                                                                                   │
-- tx-count-per-minute-by-method — windowed count per minute per method                                                                                                  │
-                                                                                                                                                                        │
----                                                                                                                                                                     │
-Architecture / Package Structure                                                                                                                                        │
-                                                                                                                                                                        │
-com.github.billingstream                                                                                                                                                │
-  config/                                                                                                                                                               │
-    KafkaStreamsConfig.java       — Kafka Streams StreamsBuilder bean + properties                                                                                      │
-    KafkaProducerConfig.java      — KafkaTemplate bean for simulators                                                                                                   │
-    TopicConfig.java              — Auto-create all 6 topics via NewTopic beans                                                                                         │
-  model/                                                                                                                                                                │
-    CardTransaction.java          — Card input model                                                                                                                    │
-    GPayTransaction.java          — GPay input model                                                                                                                    │
-    UnifiedTransaction.java       — Unified/consistent model                                                                                                            │
-    TransactionStatus.java        — Enum: SUCCESS, FAILED                                                                                                               │
-    PaymentMethod.java            — Enum: CARD, GPAY                                                                                                                    │
-  serde/                                                                                                                                                                │
-    JsonSerializer.java           — Generic Jackson serializer                                                                                                          │
-    JsonDeserializer.java         — Generic Jackson deserializer                                                                                                        │
-    JsonSerde.java                — Wraps serializer + deserializer                                                                                                     │
-  topology/                                                                                                                                                             │
-    TransactionTopology.java      — All Kafka Streams DSL logic:                                                                                                        │
-                                     1. Read card-transactions & gpay-transactions                                                                                      │
-                                     2. Filter failed → failed-transactions-dlq                                                                                         │
-                                     3. Transform to UnifiedTransaction                                                                                                 │
-                                     4. Branch by paymentMethod → transactions-card / transactions-gpay                                                                 │
-                                     5. Aggregate total amount by method (state store)                                                                                  │
-                                     6. Window tx count per minute by method (state store)                                                                              │
-  simulator/                                                                                                                                                            │
-    CardTransactionSimulator.java — Produces fake Card transactions every few seconds                                                                                   │
-    GPayTransactionSimulator.java — Produces fake GPay transactions every few seconds                                                                                   │
-  controller/                                                                                                                                                           │
-    QueryController.java          — REST endpoints to query state stores:                                                                                               │
-                                     GET /api/total-amount/{method}                                                                                                     │
-                                     GET /api/tx-count/{method}                                                                                                         │
-  BillingstreamApplication.java   — Spring Boot main class (unchanged)                                                                                                  │
-                                                                                                                                                                        │
----                                                                                                                                                                     │
-Topology Flow                                                                                                                                                           │
-                                                                                                                                                                        │
-card-transactions ──────┐                                                                                                                                               │
-                        ├──► merge ──► filter (status=FAILED) ──► failed-transactions-dlq                                                                               │
-gpay-transactions ──────┘      │                                                                                                                                        │
-                               │ (status=SUCCESS only)                                                                                                                  │
-                               ▼                                                                                                                                        │
-                         transform to UnifiedTransaction                                                                                                                │
-                               │                                                                                                                                        │
-                               ├──► branch CARD ──► transactions-card                                                                                                   │
-                               ├──► branch GPAY ──► transactions-gpay                                                                                                   │
-                               │                                                                                                                                        │
-                               ├──► groupBy(paymentMethod) ──► reduce(sum amount) ──► state store: total-amount-by-method                                               │
-                               │                                                                                                                                        │
-                               └──► groupBy(paymentMethod) ──► windowedBy(1 min tumbling) ──► count() ──► state store: tx-count-per-minute-by-method                    │
-                                                                                                                                                                        │
----                                                                                                                                                                     │
-Files to Modify / Create                                                                                                                                                │
-                                                                                                                                                                        │
-Delete (existing OTT code)                                                                                                                                              │
-                                                                                                                                                                        │
-- All files under model/ (Payment.java, Plan.java, Subscriber.java, SubscriptionEvent.java, enums)                                                                      │
-- All files under simulator/ (ReferenceDataLoader.java, PaymentEventSimulator.java, SubscriptionEventSimulator.java)                                                    │
-- config/TopicConfig.java (rewrite for new topics)                                                                                                                      │
-                                                                                                                                                                        │
-Keep & Modify                                                                                                                                                           │
-                                                                                                                                                                        │
-- config/KafkaStreamsConfig.java — keep structure, update if needed                                                                                                     │
-- config/KafkaProducerConfig.java — keep as-is (generic KafkaTemplate)                                                                                                  │
-- serde/JsonSerializer.java, JsonDeserializer.java, JsonSerde.java — keep as-is (generic)                                                                               │
-- BillingstreamApplication.java — keep as-is                                                                                                                            │
-- pom.xml — keep as-is                                                                                                                                                  │
-- application.yaml — update topic names, simulator rates                                                                                                                │
-                                                                                                                                                                        │
-Create New                                                                                                                                                              │
-                                                                                                                                                                        │
-- model/CardTransaction.java                                                                                                                                            │
-- model/GPayTransaction.java                                                                                                                                            │
-- model/UnifiedTransaction.java                                                                                                                                         │
-- model/TransactionStatus.java                                                                                                                                          │
-- model/PaymentMethod.java                                                                                                                                              │
-- simulator/CardTransactionSimulator.java                                                                                                                               │
-- simulator/GPayTransactionSimulator.java                                                                                                                               │
-- topology/TransactionTopology.java                                                                                                                                     │
-- controller/QueryController.java                                                                                                                                       │
-- config/TopicConfig.java (rewritten)                                                                                                                                   │
-                                                                                                                                                                        │
-Update                                                                                                                                                                  │
-                                                                                                                                                                        │
-- README.txt — update to reflect new use case                                                                                                                           │
-                                                                                                                                                                        │
----                                                                                                                                                                     │
-Verification                                                                                                                                                            │
-                                                                                                                                                                        │
-1. mvn clean compile — project compiles without errors                                                                                                                  │
-2. Start Kafka broker locally on localhost:9092                                                                                                                         │
-3. mvn spring-boot:run — app starts, topics auto-created, simulators produce events                                                                                     │
-4. Check failed-transactions-dlq topic receives failed transactions                                                                                                     │
-5. Check transactions-card and transactions-gpay topics receive branched data                                                                                           │
-6. GET /api/total-amount/CARD and GET /api/total-amount/GPAY return aggregated amounts                                                                                  │
+BillingStream — Billing Transaction Application
+
+A Kafka Streams learning project that processes Card and GPay payment transactions in real-time,
+performing filtering, transformation, branching, aggregation, and windowing.
+
+Tech Stack: Spring Boot 4.0.3, Java 21, Kafka Streams, Jackson JSON SerDe, Lombok, Maven
+
+---
+Use Case Summary
+
+Merchants/users make billing transactions via Card or GPay. The system:
+1. Filters failed transactions → routes to a DLQ (dead-letter queue) topic
+2. Transforms Card and GPay transactions (which have different fields) into a unified transaction format
+3. Branches/Splits unified transactions by payment method into separate topics
+4. Aggregates total transaction amount per payment method
+5. Windows transaction count per minute per payment method
+
+---
+Data Models
+
+CardTransaction (input)
+
+┌────────────────┬─────────┬─────────────────────────────────────┐
+│     Field      │  Type   │             Description             │
+├────────────────┼─────────┼─────────────────────────────────────┤
+│ transactionId  │ String  │ Unique ID                           │
+├────────────────┼─────────┼─────────────────────────────────────┤
+│ userId         │ String  │ User identifier                     │
+├────────────────┼─────────┼─────────────────────────────────────┤
+│ amount         │ double  │ Transaction amount                  │
+├────────────────┼─────────┼─────────────────────────────────────┤
+│ status         │ String  │ SUCCESS / FAILED                    │
+├────────────────┼─────────┼─────────────────────────────────────┤
+│ cardNumber     │ String  │ Masked card number (e.g., ****1234) │
+├────────────────┼─────────┼─────────────────────────────────────┤
+│ cardHolderName │ String  │ Name on card                        │
+├────────────────┼─────────┼─────────────────────────────────────┤
+│ cardNetwork    │ String  │ VISA / MASTERCARD / RUPAY           │
+├────────────────┼─────────┼─────────────────────────────────────┤
+│ expiryDate     │ String  │ MM/YY                               │
+├────────────────┼─────────┼─────────────────────────────────────┤
+│ timestamp      │ Instant │ Transaction time                    │
+└────────────────┴─────────┴─────────────────────────────────────┘
+
+GPayTransaction (input)
+
+┌─────────────────┬─────────┬───────────────────────────┐
+│      Field      │  Type   │        Description        │
+├─────────────────┼─────────┼───────────────────────────┤
+│ transactionId   │ String  │ Unique ID                 │
+├─────────────────┼─────────┼───────────────────────────┤
+│ userId          │ String  │ User identifier           │
+├─────────────────┼─────────┼───────────────────────────┤
+│ amount          │ double  │ Transaction amount        │
+├─────────────────┼─────────┼───────────────────────────┤
+│ status          │ String  │ SUCCESS / FAILED          │
+├─────────────────┼─────────┼───────────────────────────┤
+│ upiId           │ String  │ UPI ID (e.g., user@oksbi) │
+├─────────────────┼─────────┼───────────────────────────┤
+│ deviceId        │ String  │ Device identifier         │
+├─────────────────┼─────────┼───────────────────────────┤
+│ gpayReferenceId │ String  │ GPay internal reference   │
+├─────────────────┼─────────┼───────────────────────────┤
+│ timestamp       │ Instant │ Transaction time          │
+└─────────────────┴─────────┴───────────────────────────┘
+
+UnifiedTransaction (after transformation)
+
+┌──────────────────┬─────────┬────────────────────────────────────────────────┐
+│      Field       │  Type   │                  Description                   │
+├──────────────────┼─────────┼────────────────────────────────────────────────┤
+│ transactionId    │ String  │ Unique ID                                      │
+├──────────────────┼─────────┼────────────────────────────────────────────────┤
+│ userId           │ String  │ User identifier                                │
+├──────────────────┼─────────┼────────────────────────────────────────────────┤
+│ amount           │ double  │ Transaction amount                             │
+├──────────────────┼─────────┼────────────────────────────────────────────────┤
+│ status           │ String  │ SUCCESS / FAILED                               │
+├──────────────────┼─────────┼────────────────────────────────────────────────┤
+│ paymentMethod    │ String  │ CARD / GPAY                                    │
+├──────────────────┼─────────┼────────────────────────────────────────────────┤
+│ paymentReference │ String  │ cardNumber for Card, upiId for GPay            │
+├──────────────────┼─────────┼────────────────────────────────────────────────┤
+│ paymentDetail    │ String  │ cardNetwork for Card, gpayReferenceId for GPay │
+├──────────────────┼─────────┼────────────────────────────────────────────────┤
+│ timestamp        │ Instant │ Transaction time                               │
+└──────────────────┴─────────┴────────────────────────────────────────────────┘
+
+Enums
+
+- PaymentMethod: CARD, GPAY
+- TransactionStatus: SUCCESS, FAILED
+
+---
+Kafka Topics
+
+┌─────────────────────────┬─────────────────────────────────────────────┐
+│          Topic          │                   Purpose                   │
+├─────────────────────────┼─────────────────────────────────────────────┤
+│ card-transactions       │ Input — raw Card transactions               │
+├─────────────────────────┼─────────────────────────────────────────────┤
+│ gpay-transactions       │ Input — raw GPay transactions               │
+├─────────────────────────┼─────────────────────────────────────────────┤
+│ failed-transactions-dlq │ DLQ — failed transactions from both methods │
+├─────────────────────────┼─────────────────────────────────────────────┤
+│ unified-transactions    │ Transformed unified format                  │
+├─────────────────────────┼─────────────────────────────────────────────┤
+│ transactions-card       │ Branch output — Card transactions only      │
+├─────────────────────────┼─────────────────────────────────────────────┤
+│ transactions-gpay       │ Branch output — GPay transactions only      │
+└─────────────────────────┴─────────────────────────────────────────────┘
+
+State stores (materialized, queryable via REST):
+- total-amount-by-method — aggregated total amount per payment method
+- tx-count-per-minute-by-method — windowed count per minute per method
+
+---
+Architecture / Package Structure
+
+com.github.billingstream
+  config/
+    KafkaStreamsConfig.java       — Kafka Streams StreamsBuilder bean + properties
+    KafkaProducerConfig.java      — KafkaTemplate bean for simulators
+    TopicConfig.java              — Auto-create all 6 topics via NewTopic beans
+  model/
+    CardTransaction.java          — Card input model
+    GPayTransaction.java          — GPay input model
+    UnifiedTransaction.java       — Unified/consistent model
+    TransactionStatus.java        — Enum: SUCCESS, FAILED
+    PaymentMethod.java            — Enum: CARD, GPAY
+  serde/
+    JsonSerializer.java           — Generic Jackson serializer
+    JsonDeserializer.java         — Generic Jackson deserializer
+    JsonSerde.java                — Wraps serializer + deserializer
+  topology/
+    TransactionTopology.java      — All Kafka Streams DSL logic:
+                                     1. Read card-transactions & gpay-transactions
+                                     2. Filter failed → failed-transactions-dlq
+                                     3. Transform to UnifiedTransaction
+                                     4. Branch by paymentMethod → transactions-card / transactions-gpay
+                                     5. Aggregate total amount by method (state store)
+                                     6. Window tx count per minute by method (state store)
+  simulator/
+    CardTransactionSimulator.java — Produces fake Card transactions every few seconds
+    GPayTransactionSimulator.java — Produces fake GPay transactions every few seconds
+  controller/
+    QueryController.java          — REST endpoints to query state stores:
+                                     GET /api/total-amount/{method}
+                                     GET /api/tx-count/{method}
+  BillingstreamApplication.java   — Spring Boot main class
+
+---
+Topology Flow
+
+card-transactions ──────┐
+                        ├──► merge ──► filter (status=FAILED) ──► failed-transactions-dlq
+gpay-transactions ──────┘      │
+                               │ (status=SUCCESS only)
+                               ▼
+                         transform to UnifiedTransaction
+                               │
+                               ├──► branch CARD ──► transactions-card
+                               ├──► branch GPAY ──► transactions-gpay
+                               │
+                               ├──► groupBy(paymentMethod) ──► reduce(sum amount) ──► state store: total-amount-by-method
+                               │
+                               └──► groupBy(paymentMethod) ──► windowedBy(1 min tumbling) ──► count() ──► state store: tx-count-per-minute-by-method
+
+---
+Verification
+
+1. mvn clean compile — project compiles without errors
+2. Start Kafka broker locally on localhost:9092
+3. mvn spring-boot:run — app starts, topics auto-created, simulators produce events
+4. Check failed-transactions-dlq topic receives failed transactions
+5. Check transactions-card and transactions-gpay topics receive branched data
+6. GET /api/total-amount/CARD and GET /api/total-amount/GPAY return aggregated amounts
 7. GET /api/tx-count/CARD and GET /api/tx-count/GPAY return windowed counts
