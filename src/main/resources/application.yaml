@@ -5,6 +5,10 @@ spring:
   kafka:
     bootstrap-servers: localhost:9092
 
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: com.github.billingstream.serde.JsonSerializer
+
     streams:
       application-id: billingstream
       properties:
@@ -12,4 +16,4 @@ spring:
         default.value.serde: org.apache.kafka.common.serialization.Serdes$StringSerde
 
 server:
-  port: 8080
+  port: 8082

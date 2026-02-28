@@ -19,20 +19,23 @@
 **Note:** Default value serde is `StringSerde` because our `JsonSerde` needs a type arg. We override per-stream in topology.
 
 ## Step 5 — Config (`config/`)
-**Files:** `TopicConfig.java`, `KafkaProducerConfig.java`, `KafkaStreamsConfig.java`
+**Files:** `TopicConfig.java`, `KafkaStreamsConfig.java`
 **Purpose:**
 - `TopicConfig` — 6 `NewTopic` beans for auto-creating topics on startup. Only creates if topic doesn't exist; won't update existing topics. Use `kafka-topics.sh --alter` to change partitions later.
-- `KafkaProducerConfig` — `KafkaTemplate<String, Object>` bean used by simulators to produce test data.
 - `KafkaStreamsConfig` — `@EnableKafkaStreams` to create the `StreamsBuilder` bean + sets `STATESTORE_CACHE_MAX_BYTES_CONFIG=0` for immediate state store visibility during dev.
+**Note:** `KafkaProducerConfig` was removed — Spring Boot auto-configures `KafkaTemplate` from `spring-boot-starter-kafka`.
 
 ## Step 6 — Topology (`topology/`)
 **File:** `TransactionTopology.java`
-**Purpose:** (pending)
+**Purpose:** All Kafka Streams DSL logic in one class. Uses `@PostConstruct` on injected `StreamsBuilder`. Flow: read card/gpay → mapValues to UnifiedTransaction → merge → split by status (FAILED→DLQ, SUCCESS continues) → write to unified-transactions → branch by payment method (CARD/GPAY topics) → aggregate total amount per method (KTable, state store) → windowed count per minute per method (windowed state store). Uses `split().branch()` instead of `filter()` for single-pass efficiency.
 
 ## Step 7 — Simulators (`simulator/`)
 **Files:** `CardTransactionSimulator.java`, `GPayTransactionSimulator.java`
-**Purpose:** (pending)
+**Purpose:** `@Scheduled` producers that generate random transactions every 3 seconds via `KafkaTemplate`. ~20% failure rate. Card simulator produces to `card-transactions`, GPay to `gpay-transactions`. Used for testing the topology without external data.
 
 ## Step 8 — Controller (`controller/`)
 **File:** `QueryController.java`
-**Purpose:** (pending)
+**Purpose:** REST endpoints for interactive queries against state stores. Uses `StreamsBuilderFactoryBean` to access `KafkaStreams` runtime instance.
+- `GET /api/total-amount/{method}` — queries `total-amount-by-method` KTable store for running total.
+- `GET /api/tx-count/{method}` — queries `tx-count-per-minute-by-method` windowed store, fetches last 10 minutes of 1-minute windows.
+- Returns 503 if state store not ready (startup/rebalancing).
