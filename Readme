@@ -176,3 +176,93 @@ Verification
 5. Check transactions-card and transactions-gpay topics receive branched data
 6. GET /api/total-amount/CARD and GET /api/total-amount/GPAY return aggregated amounts
 7. GET /api/tx-count/CARD and GET /api/tx-count/GPAY return windowed counts
+
+---
+Kafka Topics — Deep Dive (10 Total)
+
+This application creates 10 Kafka topics — 6 user-defined and 4 auto-created by Kafka Streams.
+
+User-Defined Topics (6)
+
+┌─────────────────────────┬──────────────────────────────────────────────────────────────────┐
+│          Topic          │                            Purpose                               │
+├─────────────────────────┼──────────────────────────────────────────────────────────────────┤
+│ card-transactions       │ Input — raw Card transactions (produced by simulator)             │
+├─────────────────────────┼──────────────────────────────────────────────────────────────────┤
+│ gpay-transactions       │ Input — raw GPay transactions (produced by simulator)             │
+├─────────────────────────┼──────────────────────────────────────────────────────────────────┤
+│ failed-transactions-dlq │ Dead Letter Queue — transactions with status=FAILED routed here  │
+├─────────────────────────┼──────────────────────────────────────────────────────────────────┤
+│ unified-transactions    │ Transformed output — Card & GPay converted to UnifiedTransaction │
+├─────────────────────────┼──────────────────────────────────────────────────────────────────┤
+│ transactions-card       │ Branch output — only CARD payment method transactions            │
+├─────────────────────────┼──────────────────────────────────────────────────────────────────┤
+│ transactions-gpay       │ Branch output — only GPAY payment method transactions            │
+└─────────────────────────┴──────────────────────────────────────────────────────────────────┘
+
+Auto-Created Topics by Kafka Streams (4)
+
+These are internal topics created automatically because of the two stateful operations
+(total-amount aggregation and windowed tx-count).
+
+--- Repartition Topics ---
+
+  billingstream-total-amount-by-method-repartition
+  billingstream-tx-count-per-minute-by-method-repartition
+
+Why? When you do selectKey() followed by groupByKey() and then aggregate()/count(),
+Kafka Streams needs to RE-PARTITION the data by the new key (PaymentMethod).
+
+The original messages are keyed by transactionId, but aggregation needs all records
+with the same payment method on the SAME PARTITION. Kafka Streams writes records to
+an internal repartition topic with the new key so Kafka's partitioner can route them correctly.
+
+  [transactionId=abc, method=CARD] ──selectKey──▶ [key=CARD] ──write──▶ repartition topic
+  [transactionId=xyz, method=CARD] ──selectKey──▶ [key=CARD] ──write──▶ repartition topic
+                                                                           │
+                                                                same partition (both key=CARD)
+                                                                           │
+                                                                      ▼ aggregate()
+
+Think of it as a shuffle/redistribute step — similar to a MapReduce shuffle.
+
+--- Changelog Topics ---
+
+  billingstream-total-amount-by-method-changelog
+  billingstream-tx-count-per-minute-by-method-changelog
+
+Why? Aggregations maintain STATE STORES (RocksDB key-value stores). If the app crashes,
+you'd lose all aggregated state. Kafka Streams writes every state change to a changelog
+topic as a backup.
+
+  State store: { CARD: 1500.00 }
+      ──new transaction CARD $200──▶
+  State store: { CARD: 1700.00 }
+      ──also writes──▶ changelog topic: [key=CARD, value=1700.00]
+
+On restart, Kafka Streams REPLAYS the changelog topic to rebuild the state store — no data loss.
+
+--- Naming Pattern ---
+
+All auto-created topics follow: {application.id}-{store-name}-{changelog|repartition}
+
+  application.id = billingstream
+  Store names    = total-amount-by-method, tx-count-per-minute-by-method
+
+Topic Summary
+
+┌──────────────────────────┬───────┬──────────────────────────────────────────────┐
+│        Topic Type        │ Count │                   Purpose                    │
+├──────────────────────────┼───────┼──────────────────────────────────────────────┤
+│ Input topics             │   2   │ Feed raw data in                             │
+├──────────────────────────┼───────┼──────────────────────────────────────────────┤
+│ Output/branch topics     │   3   │ Filtered & transformed results               │
+├──────────────────────────┼───────┼──────────────────────────────────────────────┤
+│ DLQ                      │   1   │ Failed transactions                          │
+├──────────────────────────┼───────┼──────────────────────────────────────────────┤
+│ Repartition (internal)   │   2   │ Re-key data for grouping by payment method   │
+├──────────────────────────┼───────┼──────────────────────────────────────────────┤
+│ Changelog (internal)     │   2   │ Backup state stores for fault tolerance      │
+├──────────────────────────┼───────┼──────────────────────────────────────────────┤
+│ TOTAL                    │  10   │                                              │
+└──────────────────────────┴───────┴──────────────────────────────────────────────┘
